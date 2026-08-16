@@ -16,13 +16,13 @@ def make_engine(**over):
 
 
 def test_axis_velocity():
-    eng = make_engine()  # gain 1.5, deadband 0.08, min 0.15
+    eng = make_engine()  # gain 0.6, deadband 0.06, min 0.1, max 0.4
     assert eng._axis_velocity(0.02) == 0.0          # inside deadband
-    assert eng._axis_velocity(0.10) == 0.15         # below min -> min floor
-    assert eng._axis_velocity(0.60) == 0.9          # proportional (0.6*1.5)
-    assert eng._axis_velocity(0.90) == 1.0          # clamped to max
-    assert eng._axis_velocity(-0.60) == -0.9        # sign preserved
-    print("PASS  proportional axis velocity (deadband / min / gain / clamp / sign)")
+    assert eng._axis_velocity(0.10) == 0.1          # below min -> min floor
+    assert eng._axis_velocity(0.60) == 0.36         # proportional (0.6*0.6)
+    assert eng._axis_velocity(0.90) == 0.4          # clamped to max (sustained-safe)
+    assert eng._axis_velocity(-0.60) == -0.36       # sign preserved
+    print("PASS  proportional axis velocity (deadband / min / gain / max-cap / sign)")
 
 
 def test_relative_sets_target_not_queue():
@@ -42,7 +42,7 @@ def test_controller_drives_then_watchdog_stops():
     assert moves, "controller sent no ContinuousMove"
     for b in moves:
         ET.fromstring(b)
-    assert '<PanTilt x="0.9" y="-0.6"' in moves[-1], moves[-1]
+    assert '<PanTilt x="0.36" y="-0.24"' in moves[-1], moves[-1]
     # stop feeding -> after the watchdog the camera must be told to Stop
     time.sleep(0.5)
     assert any(a.endswith("/Stop") for a, b in eng._posts), "watchdog did not Stop"

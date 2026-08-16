@@ -91,10 +91,16 @@ class MotionEngine(threading.Thread):
         # until the target re-centers or a watchdog fires. This matches manual
         # speed and holds subjects that move steadily (e.g. tilt-down on approach).
         self.tracking_mode = config.get('tracking_mode', 'pulse')
-        self.track_gain = config.get('track_gain', 1.5)
-        self.track_deadband = config.get('track_deadband', 0.08)
-        self.track_min_velocity = config.get('track_min_velocity', 0.15)
-        self.track_watchdog = config.get('track_watchdog', 0.75)
+        self.track_gain = config.get('track_gain', 0.6)
+        self.track_deadband = config.get('track_deadband', 0.06)
+        self.track_min_velocity = config.get('track_min_velocity', 0.1)
+        # Cap the SUSTAINED velocity low: unlike a pulse, this speed is held, so
+        # a high cap overshoots the target out of frame before Frigate corrects.
+        self.track_max_velocity = config.get('track_max_velocity', 0.4)
+        self.track_watchdog = config.get('track_watchdog', 0.5)
+        # Flip a mirrored axis without touching manual control (which is fine).
+        self.track_invert_pan = config.get('track_invert_pan', False)
+        self.track_invert_tilt = config.get('track_invert_tilt', False)
         self.target = (0.0, 0.0, 0.0)
         self.last_target_ts = 0.0
         self.manual_active = False
@@ -185,7 +191,7 @@ class MotionEngine(threading.Thread):
     def _axis_velocity(self, err):
         if abs(err) < self.track_deadband:
             return 0.0
-        mag = round(min(1.0, max(self.track_min_velocity, abs(err) * self.track_gain)), 3)
+        mag = round(min(self.track_max_velocity, max(self.track_min_velocity, abs(err) * self.track_gain)), 3)
         return mag if err > 0 else -mag
 
     def _run_continuous(self):
@@ -202,6 +208,10 @@ class MotionEngine(threading.Thread):
                 continue
             tx, ty, tz = self.target
             vx, vy, vz = self._axis_velocity(tx), self._axis_velocity(ty), self._axis_velocity(tz)
+            if self.track_invert_pan:
+                vx = -vx
+            if self.track_invert_tilt:
+                vy = -vy
             if vx == 0.0 and vy == 0.0 and vz == 0.0:
                 if self.current_vel != (0.0, 0.0, 0.0):
                     self._send_stop()
