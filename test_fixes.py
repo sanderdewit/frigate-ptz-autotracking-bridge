@@ -25,7 +25,7 @@ def test_dispatch_coalesce():  # #10
     eng.dispatch_move("RELATIVE", 0.2, 0.0)
     eng.dispatch_move("RELATIVE", 0.3, 0.0)
     assert eng.work_queue.qsize() == 1, eng.work_queue.qsize()
-    mt, x, y = eng.work_queue.get_nowait()
+    mt, x, y, z = eng.work_queue.get_nowait()
     assert (mt, x) == ("RELATIVE", 0.3)
     print("PASS  #10 dispatch_move coalesces stale relative moves")
 

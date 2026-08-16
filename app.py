@@ -27,7 +27,7 @@ NAMESPACES = {
 for prefix, uri in NAMESPACES.items():
     ET.register_namespace(prefix, uri)
 
-CMDS = {"stop": 0, "up": 1, "down": 2, "left": 3, "right": 4}
+CMDS = {"stop": 0, "up": 1, "down": 2, "left": 3, "right": 4, "zoom_in": 13, "zoom_out": 14}
 
 
 def _to_float(value, default=0.0):
@@ -80,21 +80,22 @@ class MotionEngine(threading.Thread):
         self.profile_token = config.get('profile_token', 'Profile_1')
         self.onvif_pan_velocity = config.get('onvif_pan_velocity', 0.5)
         self.onvif_tilt_velocity = config.get('onvif_tilt_velocity', 0.5)
+        self.onvif_zoom_velocity = config.get('onvif_zoom_velocity', 0.6)
         self.home_preset_token = str(config.get('home_preset_token', '1'))
         self.onvif_session = requests.Session()
 
     def run(self):
         while True:
             try:
-                move_type, x, y = self.work_queue.get(timeout=0.1)
-                self._process_movement(move_type, x, y)
+                move_type, x, y, z = self.work_queue.get(timeout=0.1)
+                self._process_movement(move_type, x, y, z)
                 self.work_queue.task_done()
             except queue.Empty:
                 with self.lock:
                     if self.is_moving and time.time() >= self.move_end_time:
                         self.is_moving = False
 
-    def dispatch_move(self, move_type, x, y):
+    def dispatch_move(self, move_type, x, y, z=0.0):
         # Coalesce: a newer relative target supersedes stale queued moves, so the
         # engine always acts on the freshest vector instead of lagging behind a
         # backlog of pulses when a subject moves quickly.
@@ -105,7 +106,7 @@ class MotionEngine(threading.Thread):
                     self.work_queue.task_done()
                 except queue.Empty:
                     break
-        self.work_queue.put((move_type, x, y))
+        self.work_queue.put((move_type, x, y, z))
 
     def force_stop(self):
         while not self.work_queue.empty():
@@ -126,20 +127,22 @@ class MotionEngine(threading.Thread):
                 self.is_moving = False
             return "MOVING" if self.is_moving else "IDLE", self.virtual_pan, self.virtual_tilt
 
-    def _process_movement(self, move_type, x, y):
+    def _process_movement(self, move_type, x, y, z=0.0):
         current_time = time.time()
-        print(f"[{self.name}] 📊 Vector: x={x:.3f} y={y:.3f} ({move_type})")
+        print(f"[{self.name}] 📊 Vector: x={x:.3f} y={y:.3f} z={z:.3f} ({move_type})")
 
         if move_type == "RELATIVE":
             if (current_time - self.last_move_completion) < self.cooldown_window:
-                return 
+                return
 
             pan_dur = max(0.10, min(0.45, abs(x) * self.scale_multiplier)) if abs(x) > 0.05 else 0.0
             tilt_dur = max(0.10, min(0.45, abs(y) * self.scale_multiplier)) if abs(y) > 0.05 else 0.0
+            zoom_dur = max(0.10, min(0.45, abs(z) * self.scale_multiplier)) if abs(z) > 0.05 else 0.0
             pan_dir = "right" if x > 0 else "left" if x < 0 else "stop"
             tilt_dir = "up" if y > 0 else "down" if y < 0 else "stop"
+            zoom_dir = "zoom_in" if z > 0 else "zoom_out" if z < 0 else "stop"
 
-            if pan_dir == "stop" and tilt_dir == "stop":
+            if pan_dir == "stop" and tilt_dir == "stop" and zoom_dir == "stop":
                 self.force_stop()
                 return
 
@@ -153,15 +156,20 @@ class MotionEngine(threading.Thread):
                 drift = tilt_dur * self.encoder_speed_factor
                 self.virtual_tilt = max(-1.0, min(1.0, self.virtual_tilt + (drift if tilt_dir == "up" else -drift)))
 
+            if zoom_dur > 0 and zoom_dir != "stop":
+                self._execute_hardware_pulse(zoom_dir, zoom_dur)
+
             self.last_move_completion = time.time()
 
-        else: 
+        else:
             direction = "stop"
             if x > 0: direction = "right"
             elif x < 0: direction = "left"
             elif y > 0: direction = "up"
             elif y < 0: direction = "down"
-            
+            elif z > 0: direction = "zoom_in"
+            elif z < 0: direction = "zoom_out"
+
             if direction == "stop":
                 self.force_stop()
             else:
@@ -244,6 +252,12 @@ class MotionEngine(threading.Thread):
                     '<PanTilt>true</PanTilt><Zoom>true</Zoom></Stop>')
             self._onvif_post(f"{PTZ}/Stop", body)
             return
+        if direction in ("zoom_in", "zoom_out"):
+            vz = self.onvif_zoom_velocity if direction == "zoom_in" else -self.onvif_zoom_velocity
+            body = (f'<ContinuousMove xmlns="{PTZ}"><ProfileToken>{self.profile_token}</ProfileToken>'
+                    f'<Velocity><Zoom x="{vz}" xmlns="{SC}"/></Velocity></ContinuousMove>')
+            self._onvif_post(f"{PTZ}/ContinuousMove", body)
+            return
         vx = {"left": -self.onvif_pan_velocity, "right": self.onvif_pan_velocity}.get(direction, 0.0)
         vy = {"up": self.onvif_tilt_velocity, "down": -self.onvif_tilt_velocity}.get(direction, 0.0)
         body = (f'<ContinuousMove xmlns="{PTZ}"><ProfileToken>{self.profile_token}</ProfileToken>'
@@ -290,28 +304,30 @@ def create_proxy_app(engine):
             return Response(f"""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><SOAP-ENV:Body><tds:GetCapabilitiesResponse><tds:Capabilities><tt:Device><tt:XAddr>{dev_uri}</tt:XAddr></tt:Device><tt:Media><tt:XAddr>{dev_uri}</tt:XAddr></tt:Media><tt:PTZ><tt:XAddr>{ptz_uri}</tt:XAddr></tt:PTZ></tds:Capabilities></tds:GetCapabilitiesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//trt:GetProfiles', NAMESPACES) is not None:
-            return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><SOAP-ENV:Body><trt:GetProfilesResponse><trt:Profiles token="Profile_1"><tt:Name>MainProfile</tt:Name><tt:VideoEncoderConfiguration token="VideoEncoder_1"><tt:Name>VideoConfig</tt:Name><tt:UseCount>1</tt:UseCount><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>1280</tt:Width><tt:Height>960</tt:Height></tt:Resolution></tt:VideoEncoderConfiguration><tt:PTZConfiguration token="PTZ_1"><tt:Name>PTZConfig</tt:Name><tt:DefaultRelativePanTiltTranslationSpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationSpaceFov</tt:DefaultRelativePanTiltTranslationSpace><tt:DefaultContinuousPanTiltVelocitySpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocitySpaceGeneric</tt:DefaultContinuousPanTiltVelocitySpace></tt:PTZConfiguration></trt:Profiles></trt:GetProfilesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
+            return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><SOAP-ENV:Body><trt:GetProfilesResponse><trt:Profiles token="Profile_1"><tt:Name>MainProfile</tt:Name><tt:VideoEncoderConfiguration token="VideoEncoder_1"><tt:Name>VideoConfig</tt:Name><tt:UseCount>1</tt:UseCount><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>1280</tt:Width><tt:Height>960</tt:Height></tt:Resolution></tt:VideoEncoderConfiguration><tt:PTZConfiguration token="PTZ_1"><tt:Name>PTZConfig</tt:Name><tt:DefaultRelativePanTiltTranslationSpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationSpaceFov</tt:DefaultRelativePanTiltTranslationSpace><tt:DefaultContinuousPanTiltVelocitySpace>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocitySpaceGeneric</tt:DefaultContinuousPanTiltVelocitySpace><tt:DefaultContinuousZoomVelocitySpace>http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace</tt:DefaultContinuousZoomVelocitySpace></tt:PTZConfiguration></trt:Profiles></trt:GetProfilesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//tptz:GetConfigurationOptions', NAMESPACES) is not None:
-            return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><SOAP-ENV:Body><tptz:GetConfigurationOptionsResponse><tptz:PTZConfigurationOptions><tt:Spaces><tt:RelativePanTiltTranslationSpace><tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationSpaceFov</tt:URI><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange></tt:RelativePanTiltTranslationSpace></tt:Spaces></tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
+            return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><SOAP-ENV:Body><tptz:GetConfigurationOptionsResponse><tptz:PTZConfigurationOptions><tt:Spaces><tt:RelativePanTiltTranslationSpace><tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/TranslationSpaceFov</tt:URI><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange></tt:RelativePanTiltTranslationSpace><tt:ContinuousZoomVelocitySpace><tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace</tt:URI><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange></tt:ContinuousZoomVelocitySpace></tt:Spaces></tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//tptz:GetServiceCapabilities', NAMESPACES) is not None:
             return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><SOAP-ENV:Body><tptz:GetServiceCapabilitiesResponse><tptz:Capabilities MoveStatus="true" /></tptz:GetServiceCapabilitiesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//tptz:RelativeMove', NAMESPACES) is not None:
             pan_tilt_elem = root.find('.//tt:PanTilt', NAMESPACES)
-            if pan_tilt_elem is not None:
-                x = _to_float(pan_tilt_elem.get('x'))
-                y = _to_float(pan_tilt_elem.get('y'))
-                engine.dispatch_move("RELATIVE", x, y)
+            zoom_elem = root.find('.//tt:Zoom', NAMESPACES)
+            x = _to_float(pan_tilt_elem.get('x')) if pan_tilt_elem is not None else 0.0
+            y = _to_float(pan_tilt_elem.get('y')) if pan_tilt_elem is not None else 0.0
+            z = _to_float(zoom_elem.get('x')) if zoom_elem is not None else 0.0
+            engine.dispatch_move("RELATIVE", x, y, z)
             return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><SOAP-ENV:Body><tptz:RelativeMoveResponse/></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//tptz:ContinuousMove', NAMESPACES) is not None:
             pan_tilt_elem = root.find('.//tt:PanTilt', NAMESPACES)
-            if pan_tilt_elem is not None:
-                x = _to_float(pan_tilt_elem.get('x'))
-                y = _to_float(pan_tilt_elem.get('y'))
-                engine.dispatch_move("CONTINUOUS", x, y)
+            zoom_elem = root.find('.//tt:Zoom', NAMESPACES)
+            x = _to_float(pan_tilt_elem.get('x')) if pan_tilt_elem is not None else 0.0
+            y = _to_float(pan_tilt_elem.get('y')) if pan_tilt_elem is not None else 0.0
+            z = _to_float(zoom_elem.get('x')) if zoom_elem is not None else 0.0
+            engine.dispatch_move("CONTINUOUS", x, y, z)
             return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><SOAP-ENV:Body><tptz:ContinuousMoveResponse/></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//tptz:GetStatus', NAMESPACES) is not None:
