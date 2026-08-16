@@ -84,7 +84,29 @@ class MotionEngine(threading.Thread):
         self.home_preset_token = str(config.get('home_preset_token', '1'))
         self.onvif_session = requests.Session()
 
+        # --- Continuous tracking mode (config: tracking_mode: continuous) -------
+        # Instead of discrete pulse-and-stop, drive the camera with a proportional
+        # continuous-velocity controller: velocity scales with how far off-center
+        # the target is, and the camera keeps moving (like a held manual button)
+        # until the target re-centers or a watchdog fires. This matches manual
+        # speed and holds subjects that move steadily (e.g. tilt-down on approach).
+        self.tracking_mode = config.get('tracking_mode', 'pulse')
+        self.track_gain = config.get('track_gain', 1.5)
+        self.track_deadband = config.get('track_deadband', 0.08)
+        self.track_min_velocity = config.get('track_min_velocity', 0.15)
+        self.track_watchdog = config.get('track_watchdog', 0.75)
+        self.target = (0.0, 0.0, 0.0)
+        self.last_target_ts = 0.0
+        self.manual_active = False
+        self.current_vel = (0.0, 0.0, 0.0)
+
     def run(self):
+        if self.tracking_mode == "continuous":
+            self._run_continuous()
+        else:
+            self._run_pulse()
+
+    def _run_pulse(self):
         while True:
             try:
                 move_type, x, y, z = self.work_queue.get(timeout=0.1)
@@ -123,9 +145,104 @@ class MotionEngine(threading.Thread):
 
     def get_engine_status(self):
         with self.lock:
-            if self.is_moving and time.time() >= self.move_end_time:
-                self.is_moving = False
-            return "MOVING" if self.is_moving else "IDLE", self.virtual_pan, self.virtual_tilt
+            if self.tracking_mode == "continuous":
+                moving = self.current_vel != (0.0, 0.0, 0.0)
+            else:
+                if self.is_moving and time.time() >= self.move_end_time:
+                    self.is_moving = False
+                moving = self.is_moving
+            return ("MOVING" if moving else "IDLE"), self.virtual_pan, self.virtual_tilt
+
+    # ---- Continuous tracking controller (tracking_mode == "continuous") ------
+    def on_relative_move(self, x, y, z=0.0):
+        """Autotracking correction. Continuous mode: update the target error."""
+        if self.tracking_mode == "continuous":
+            self.target = (x, y, z)
+            self.last_target_ts = time.time()
+        else:
+            self.dispatch_move("RELATIVE", x, y, z)
+
+    def on_continuous_move(self, x, y, z=0.0):
+        """Manual PTZ (held button). Continuous mode: direct passthrough."""
+        if self.tracking_mode == "continuous":
+            self.manual_active = (abs(x) > 0.001 or abs(y) > 0.001 or abs(z) > 0.001)
+            if self.manual_active:
+                self._send_velocity(x, y, z)
+            else:
+                self._send_stop()
+        else:
+            self.dispatch_move("CONTINUOUS", x, y, z)
+
+    def on_stop(self):
+        if self.tracking_mode == "continuous":
+            self.manual_active = False
+            self.target = (0.0, 0.0, 0.0)
+            self.last_target_ts = 0.0
+            self._send_stop()
+        else:
+            self.force_stop()
+
+    def _axis_velocity(self, err):
+        if abs(err) < self.track_deadband:
+            return 0.0
+        mag = round(min(1.0, max(self.track_min_velocity, abs(err) * self.track_gain)), 3)
+        return mag if err > 0 else -mag
+
+    def _run_continuous(self):
+        dt = 0.04
+        while True:
+            now = time.time()
+            if self.manual_active:
+                time.sleep(dt)
+                continue
+            if now - self.last_target_ts > self.track_watchdog:
+                if self.current_vel != (0.0, 0.0, 0.0):
+                    self._send_stop()
+                time.sleep(dt)
+                continue
+            tx, ty, tz = self.target
+            vx, vy, vz = self._axis_velocity(tx), self._axis_velocity(ty), self._axis_velocity(tz)
+            if vx == 0.0 and vy == 0.0 and vz == 0.0:
+                if self.current_vel != (0.0, 0.0, 0.0):
+                    self._send_stop()
+            else:
+                cx, cy, cz = self.current_vel
+                if abs(vx - cx) > 0.05 or abs(vy - cy) > 0.05 or abs(vz - cz) > 0.05:
+                    self._send_velocity(vx, vy, vz)
+            # rough dead-reckon so GetStatus reports a plausible position
+            cvx, cvy, _ = self.current_vel
+            self.virtual_pan = max(-1.0, min(1.0, self.virtual_pan + cvx * dt * self.encoder_speed_factor))
+            self.virtual_tilt = max(-1.0, min(1.0, self.virtual_tilt + cvy * dt * self.encoder_speed_factor))
+            time.sleep(dt)
+
+    @staticmethod
+    def _dominant_direction(vx, vy, vz):
+        m = max(abs(vx), abs(vy), abs(vz))
+        if m < 0.001:
+            return None
+        if abs(vx) == m:
+            return "right" if vx > 0 else "left"
+        if abs(vy) == m:
+            return "up" if vy > 0 else "down"
+        return "zoom_in" if vz > 0 else "zoom_out"
+
+    def _send_velocity(self, vx, vy, vz):
+        self.current_vel = (vx, vy, vz)
+        if self.driver == "onvif":
+            PTZ = "http://www.onvif.org/ver20/ptz/wsdl"
+            SC = "http://www.onvif.org/ver10/schema"
+            zoom_xml = f'<Zoom x="{vz}" xmlns="{SC}"/>' if abs(vz) > 0.001 else ''
+            body = (f'<ContinuousMove xmlns="{PTZ}"><ProfileToken>{self.profile_token}</ProfileToken>'
+                    f'<Velocity><PanTilt x="{vx}" y="{vy}" xmlns="{SC}"/>{zoom_xml}</Velocity></ContinuousMove>')
+            self._onvif_post(f"{PTZ}/ContinuousMove", body)
+        else:
+            direction = self._dominant_direction(vx, vy, vz)
+            if direction:
+                self._send_generic_cgi_cmd(direction)
+
+    def _send_stop(self):
+        self.current_vel = (0.0, 0.0, 0.0)
+        self._send_cmd("stop")
 
     def _process_movement(self, move_type, x, y, z=0.0):
         current_time = time.time()
@@ -318,7 +435,7 @@ def create_proxy_app(engine):
             x = _to_float(pan_tilt_elem.get('x')) if pan_tilt_elem is not None else 0.0
             y = _to_float(pan_tilt_elem.get('y')) if pan_tilt_elem is not None else 0.0
             z = _to_float(zoom_elem.get('x')) if zoom_elem is not None else 0.0
-            engine.dispatch_move("RELATIVE", x, y, z)
+            engine.on_relative_move(x, y, z)
             return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><SOAP-ENV:Body><tptz:RelativeMoveResponse/></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//tptz:ContinuousMove', NAMESPACES) is not None:
@@ -327,7 +444,7 @@ def create_proxy_app(engine):
             x = _to_float(pan_tilt_elem.get('x')) if pan_tilt_elem is not None else 0.0
             y = _to_float(pan_tilt_elem.get('y')) if pan_tilt_elem is not None else 0.0
             z = _to_float(zoom_elem.get('x')) if zoom_elem is not None else 0.0
-            engine.dispatch_move("CONTINUOUS", x, y, z)
+            engine.on_continuous_move(x, y, z)
             return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><SOAP-ENV:Body><tptz:ContinuousMoveResponse/></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//tptz:GetStatus', NAMESPACES) is not None:
@@ -335,7 +452,7 @@ def create_proxy_app(engine):
             return Response(f"""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><SOAP-ENV:Body><tptz:GetStatusResponse><tptz:PTZStatus><tt:Position><tt:PanTilt x="{virt_p:.4f}" y="{virt_t:.4f}" space="http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace"/><tt:Zoom x="0.0" space="http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace"/></tt:Position><tt:MoveStatus><tt:PanTilt>{current_status}</tt:PanTilt><tt:Zoom>IDLE</tt:Zoom></tt:MoveStatus></tptz:PTZStatus></tptz:GetStatusResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//tptz:Stop', NAMESPACES) is not None:
-            engine.force_stop()
+            engine.on_stop()
             return Response("""<?xml version="1.0" encoding="utf-8"?><SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><SOAP-ENV:Body><tptz:StopResponse/></SOAP-ENV:Body></SOAP-ENV:Envelope>""", mimetype='application/soap+xml')
 
         elif root.find('.//tptz:GetPresets', NAMESPACES) is not None:
